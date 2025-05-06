@@ -1,0 +1,2 @@
+- Create a temporary trait in case of Orphan rule 
+- Create a field attr "omit"
