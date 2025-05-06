@@ -1,11 +1,11 @@
 use {
     proc_macro::TokenStream,
-    proc_macro2::TokenStream as TokenStream2,
+    proc_macro2::{Span, TokenStream as TokenStream2},
     quote::quote,
-    std::collections::HashSet,
     syn::{
         DeriveInput,
-        Ident,
+        Expr,
+        Path,
         Token,
         parse::{Parse, ParseStream},
         parse_macro_input,
@@ -14,14 +14,50 @@ use {
 };
 
 struct Args {
-    structs: HashSet<Ident>,
+    structs: Vec<StructWithMaybeFunction>,
+}
+
+struct StructWithMaybeFunction {
+    path: Path,
+    opt_fn: Option<Path>,
 }
 
 impl Parse for Args {
     fn parse(input: ParseStream) -> Result<Self, syn::Error> {
-        let structs = Punctuated::<Ident, Token![,]>::parse_terminated(input)?;
+        let structs = Punctuated::<syn::Expr, Token![,]>::parse_terminated(input)?;
         Ok(Args {
-            structs: structs.into_iter().collect(),
+            structs: structs
+                .into_iter()
+                .map(|expr| {
+                    Ok(match expr {
+                        Expr::Path(path) => {
+                            StructWithMaybeFunction {
+                                path: path.path,
+                                opt_fn: None,
+                            }
+                        },
+                        Expr::Call(call) => {
+                            StructWithMaybeFunction {
+                                path: match *call.func {
+                                    Expr::Path(expr_path) => expr_path.path,
+                                    _ => unreachable!(),
+                                },
+                                opt_fn: Some(match call.args.into_iter().next() {
+                                    Some(Expr::Path(expr_path)) => expr_path.path,
+                                    None => {
+                                        return Err(syn::Error::new(
+                                            Span::call_site(),
+                                            "Expected at least one argument between parenthesis",
+                                        ));
+                                    },
+                                    _ => unreachable!(),
+                                }),
+                            }
+                        },
+                        _ => panic!("Unexpected."),
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
         })
     }
 }
@@ -39,26 +75,36 @@ pub fn catfishing(args: TokenStream, input: TokenStream) -> TokenStream {
         .into();
     };
 
-    let methods: Vec<_> = fields
-        .into_iter()
-        .map(|field| {
-            let field_name = &field.ident;
-            let field_ty = &field.ty;
-
-            quote! {
-                fn #field_name(&self) -> &#field_ty {
-                    &self.0.#field_name
-                }
-            }
-        })
-        .collect();
-
     let implementations: Vec<_> = args_parsed
         .structs
         .iter()
-        .map(|r#struct| {
+        .map(|struct_with_maybe_function| {
+            let methods: Vec<_> = fields
+                .into_iter()
+                .map(|field| {
+                    let field_name = &field.ident;
+                    let field_ty = &field.ty;
+
+                    if let Some(r#fn) = &struct_with_maybe_function.opt_fn {
+                        quote! {
+                            pub fn #field_name(&self) -> #field_ty {
+                                #r#fn(&self.0).#field_name
+                            }
+                        }
+                    } else {
+                        quote! {
+                            pub fn #field_name(&self) -> &#field_ty {
+                                &self.0.#field_name
+                            }
+                        }
+                    }
+                })
+                .collect();
+
+            let struct_path = &struct_with_maybe_function.path;
+
             quote! {
-                impl #r#struct {
+                impl #struct_path {
                     #(#methods)*
                 }
             }
